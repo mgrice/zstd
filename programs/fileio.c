@@ -24,13 +24,15 @@
 *  Includes
 ***************************************/
 #include "platform.h"   /* Large Files support, SET_BINARY_MODE */
-#include "util.h"       /* UTIL_getFileSize, UTIL_isRegularFile */
+#include "util.h"       /* UTIL_getFileSize, UTIL_isRegularFile, UTIL_isSameFile */
 #include <stdio.h>      /* fprintf, fopen, fread, _fileno, stdin, stdout */
 #include <stdlib.h>     /* malloc, free */
 #include <string.h>     /* strcmp, strlen */
 #include <assert.h>
 #include <errno.h>      /* errno */
+#include <limits.h>     /* INT_MAX */
 #include <signal.h>
+#include "timefn.h"     /* UTIL_getTime, UTIL_clockSpanMicro */
 
 #if defined (_MSC_VER)
 #  include <sys/stat.h>
@@ -174,7 +176,7 @@ static void clearHandler(void)
 
 #if !defined(BACKTRACE_ENABLE)
 /* automatic detector : backtrace enabled by default on linux+glibc and osx */
-#  if (defined(__linux__) && defined(__GLIBC__)) \
+#  if (defined(__linux__) && (defined(__GLIBC__) && !defined(__UCLIBC__))) \
      || (defined(__APPLE__) && defined(__MACH__))
 #    define BACKTRACE_ENABLE 1
 #  else
@@ -268,6 +270,13 @@ void FIO_addAbortHandler()
         else
             return -1;
     }
+    static __int64 LONG_TELL(FILE* file) {
+        LARGE_INTEGER off, newOff;
+        off.QuadPart = 0;
+        newOff.QuadPart = 0;
+        SetFilePointerEx((HANDLE) _get_osfhandle(_fileno(file)), off, &newOff, FILE_CURRENT);
+        return newOff.QuadPart;
+    }
 #else
 #   define LONG_SEEK fseek
 #   define LONG_TELL ftell
@@ -296,6 +305,10 @@ struct FIO_prefs_s {
     int ldmMinMatch;
     int ldmBucketSizeLog;
     int ldmHashRateLog;
+    size_t streamSrcSize;
+    size_t targetCBlockSize;
+    int srcSizeHint;
+    ZSTD_literalCompressionMode_e literalCompressionMode;
 
     /* IO preferences */
     U32 removeSrcFile;
@@ -339,6 +352,10 @@ FIO_prefs_t* FIO_createPreferences(void)
     ret->ldmMinMatch = 0;
     ret->ldmBucketSizeLog = FIO_LDM_PARAM_NOTSET;
     ret->ldmHashRateLog = FIO_LDM_PARAM_NOTSET;
+    ret->streamSrcSize = 0;
+    ret->targetCBlockSize = 0;
+    ret->srcSizeHint = 0;
+    ret->literalCompressionMode = ZSTD_lcm_auto;
     return ret;
 }
 
@@ -404,6 +421,24 @@ void FIO_setRsyncable(FIO_prefs_t* const prefs, int rsyncable) {
     if ((rsyncable>0) && (prefs->nbWorkers==0))
         EXM_THROW(1, "Rsyncable mode is not compatible with single thread mode \n");
     prefs->rsyncable = rsyncable;
+}
+
+void FIO_setStreamSrcSize(FIO_prefs_t* const prefs, size_t streamSrcSize) {
+    prefs->streamSrcSize = streamSrcSize;
+}
+
+void FIO_setTargetCBlockSize(FIO_prefs_t* const prefs, size_t targetCBlockSize) {
+    prefs->targetCBlockSize = targetCBlockSize;
+}
+
+void FIO_setSrcSizeHint(FIO_prefs_t* const prefs, size_t srcSizeHint) {
+    prefs->srcSizeHint = (int)MIN((size_t)INT_MAX, srcSizeHint);
+}
+
+void FIO_setLiteralCompressionMode(
+        FIO_prefs_t* const prefs,
+        ZSTD_literalCompressionMode_e mode) {
+    prefs->literalCompressionMode = mode;
 }
 
 void FIO_setAdaptMin(FIO_prefs_t* const prefs, int minCLevel)
@@ -507,28 +542,10 @@ static FILE* FIO_openDstFile(FIO_prefs_t* const prefs, const char* srcFileName, 
         return stdout;
     }
 
-    /* ensure dst is not the same file as src */
-    if (srcFileName != NULL) {
-#ifdef _MSC_VER
-        /* note : Visual does not support file identification by inode.
-         *        The following work-around is limited to detecting exact name repetition only,
-         *        aka `filename` is considered different from `subdir/../filename` */
-        if (!strcmp(srcFileName, dstFileName)) {
-            DISPLAYLEVEL(1, "zstd: Refusing to open a output file which will overwrite the input file \n");
-            return NULL;
-        }
-#else
-        stat_t srcStat;
-        stat_t dstStat;
-        if (UTIL_getFileStat(srcFileName, &srcStat)
-            && UTIL_getFileStat(dstFileName, &dstStat)) {
-            if (srcStat.st_dev == dstStat.st_dev
-                && srcStat.st_ino == dstStat.st_ino) {
-                DISPLAYLEVEL(1, "zstd: Refusing to open a output file which will overwrite the input file \n");
-                return NULL;
-            }
-        }
-#endif
+    /* ensure dst is not the same as src */
+    if (srcFileName != NULL && UTIL_isSameFile(srcFileName, dstFileName)) {
+        DISPLAYLEVEL(1, "zstd: Refusing to open an output file which will overwrite the input file \n");
+        return NULL;
     }
 
     if (prefs->sparseFileSupport == 1) {
@@ -566,8 +583,11 @@ static FILE* FIO_openDstFile(FIO_prefs_t* const prefs, const char* srcFileName, 
     }   }
 
     {   FILE* const f = fopen( dstFileName, "wb" );
-        if (f == NULL)
+        if (f == NULL) {
             DISPLAYLEVEL(1, "zstd: %s: %s\n", dstFileName, strerror(errno));
+        } else {
+            chmod(dstFileName, 00600);
+        }
         return f;
     }
 }
@@ -620,12 +640,12 @@ typedef struct {
     size_t srcBufferSize;
     void*  dstBuffer;
     size_t dstBufferSize;
+    const char* dictFileName;
     ZSTD_CStream* cctx;
 } cRess_t;
 
 static cRess_t FIO_createCResources(FIO_prefs_t* const prefs,
                                     const char* dictFileName, int cLevel,
-                                    U64 srcSize,
                                     ZSTD_compressionParameters comprParams) {
     cRess_t ress;
     memset(&ress, 0, sizeof(ress));
@@ -647,6 +667,7 @@ static cRess_t FIO_createCResources(FIO_prefs_t* const prefs,
         size_t const dictBuffSize = FIO_createDictBuffer(&dictBuffer, dictFileName);   /* works with dictFileName==NULL */
         if (dictFileName && (dictBuffer==NULL))
             EXM_THROW(32, "allocation error : can't create dictBuffer");
+        ress.dictFileName = dictFileName;
 
         if (prefs->adaptiveMode && !prefs->ldmFlag && !comprParams.windowLog)
             comprParams.windowLog = ADAPT_WINDOWLOG_DEFAULT;
@@ -656,6 +677,10 @@ static cRess_t FIO_createCResources(FIO_prefs_t* const prefs,
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_checksumFlag, prefs->checksumFlag) );
         /* compression level */
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_compressionLevel, cLevel) );
+        /* max compressed block size */
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_targetCBlockSize, (int)prefs->targetCBlockSize) );
+        /* source size hint */
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_srcSizeHint, (int)prefs->srcSizeHint) );
         /* long distance matching */
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_enableLongDistanceMatching, prefs->ldmFlag) );
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_ldmHashLog, prefs->ldmHashLog) );
@@ -674,6 +699,7 @@ static cRess_t FIO_createCResources(FIO_prefs_t* const prefs,
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_minMatch, (int)comprParams.minMatch) );
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_targetLength, (int)comprParams.targetLength) );
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_strategy, comprParams.strategy) );
+        CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_literalCompressionMode, (int)prefs->literalCompressionMode) );
         /* multi-threading */
 #ifdef ZSTD_MULTITHREAD
         DISPLAYLEVEL(5,"set nb workers = %u \n", prefs->nbWorkers);
@@ -686,10 +712,7 @@ static cRess_t FIO_createCResources(FIO_prefs_t* const prefs,
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_rsyncable, prefs->rsyncable) );
 #endif
         /* dictionary */
-        CHECK( ZSTD_CCtx_setPledgedSrcSize(ress.cctx, srcSize) );  /* set the value temporarily for dictionary loading, to adapt compression parameters */
         CHECK( ZSTD_CCtx_loadDictionary(ress.cctx, dictBuffer, dictBuffSize) );
-        CHECK( ZSTD_CCtx_setPledgedSrcSize(ress.cctx, ZSTD_CONTENTSIZE_UNKNOWN) );  /* reset */
-
         free(dictBuffer);
     }
 
@@ -991,6 +1014,9 @@ FIO_compressZstdFrame(FIO_prefs_t* const prefs,
     /* init */
     if (fileSize != UTIL_FILESIZE_UNKNOWN) {
         CHECK(ZSTD_CCtx_setPledgedSrcSize(ress.cctx, fileSize));
+    } else if (prefs->streamSrcSize > 0) {
+      /* unknown source size; use the declared stream size */
+      CHECK( ZSTD_CCtx_setPledgedSrcSize(ress.cctx, prefs->streamSrcSize) );
     }
     (void)srcFileName;
 
@@ -1066,7 +1092,7 @@ FIO_compressZstdFrame(FIO_prefs_t* const prefs,
                         /* test if compression is blocked
                          * either because output is slow and all buffers are full
                          * or because input is slow and no job can start while waiting for at least one buffer to be filled.
-                         * note : excluse starting part, since currentJobID > 1 */
+                         * note : exclude starting part, since currentJobID > 1 */
                         if ( (zfp.consumed == previous_zfp_update.consumed)   /* no data compressed : no data available, or no more buffer to compress to, OR compression is really slow (compression of a single block is slower than update rate)*/
                           && (zfp.nbActiveWorkers == 0)                       /* confirmed : no compression ongoing */
                           ) {
@@ -1164,6 +1190,8 @@ FIO_compressFilename_internal(FIO_prefs_t* const prefs,
                               const char* dstFileName, const char* srcFileName,
                               int compressionLevel)
 {
+    UTIL_time_t const timeStart = UTIL_getTime();
+    clock_t const cpuStart = clock();
     U64 readsize = 0;
     U64 compressedfilesize = 0;
     U64 const fileSize = UTIL_getFileSize(srcFileName);
@@ -1216,6 +1244,15 @@ FIO_compressFilename_internal(FIO_prefs_t* const prefs,
         (unsigned long long)readsize, (unsigned long long) compressedfilesize,
          dstFileName);
 
+    /* Elapsed Time and CPU Load */
+    {   clock_t const cpuEnd = clock();
+        double const cpuLoad_s = (double)(cpuEnd - cpuStart) / CLOCKS_PER_SEC;
+        U64 const timeLength_ns = UTIL_clockSpanNano(timeStart);
+        double const timeLength_s = (double)timeLength_ns / 1000000000;
+        double const cpuLoad_pct = (cpuLoad_s / timeLength_s) * 100;
+        DISPLAYLEVEL(4, "%-20s : Completed in %.2f sec  (cpu load : %.0f%%)\n",
+                        srcFileName, timeLength_s, cpuLoad_pct);
+    }
     return 0;
 }
 
@@ -1299,9 +1336,15 @@ FIO_compressFilename_srcFile(FIO_prefs_t* const prefs,
 {
     int result;
 
-    /* File check */
+    /* ensure src is not a directory */
     if (UTIL_isDirectory(srcFileName)) {
         DISPLAYLEVEL(1, "zstd: %s is a directory -- ignored \n", srcFileName);
+        return 1;
+    }
+
+    /* ensure src is not the same as dict (if present) */
+    if (ress.dictFileName != NULL && UTIL_isSameFile(srcFileName, ress.dictFileName)) {
+        DISPLAYLEVEL(1, "zstd: cannot use %s as an input file and dictionary \n", srcFileName);
         return 1;
     }
 
@@ -1332,15 +1375,9 @@ int FIO_compressFilename(FIO_prefs_t* const prefs,
                          const char* dictFileName, int compressionLevel,
                          ZSTD_compressionParameters comprParams)
 {
-    clock_t const start = clock();
-    U64 const fileSize = UTIL_getFileSize(srcFileName);
-    U64 const srcSize = (fileSize == UTIL_FILESIZE_UNKNOWN) ? ZSTD_CONTENTSIZE_UNKNOWN : fileSize;
-
-    cRess_t const ress = FIO_createCResources(prefs, dictFileName, compressionLevel, srcSize, comprParams);
+    cRess_t const ress = FIO_createCResources(prefs, dictFileName, compressionLevel, comprParams);
     int const result = FIO_compressFilename_srcFile(prefs, ress, dstFileName, srcFileName, compressionLevel);
 
-    double const seconds = (double)(clock() - start) / CLOCKS_PER_SEC;
-    DISPLAYLEVEL(4, "Completed in %.2f sec \n", seconds);
 
     FIO_freeCResources(ress);
     return result;
@@ -1389,10 +1426,7 @@ int FIO_compressMultipleFilenames(FIO_prefs_t* const prefs,
                                   ZSTD_compressionParameters comprParams)
 {
     int error = 0;
-    U64 const firstFileSize = UTIL_getFileSize(inFileNamesTable[0]);
-    U64 const firstSrcSize = (firstFileSize == UTIL_FILESIZE_UNKNOWN) ? ZSTD_CONTENTSIZE_UNKNOWN : firstFileSize;
-    U64 const srcSize = (nbFiles != 1) ? ZSTD_CONTENTSIZE_UNKNOWN : firstSrcSize ;
-    cRess_t ress = FIO_createCResources(prefs, dictFileName, compressionLevel, srcSize, comprParams);
+    cRess_t ress = FIO_createCResources(prefs, dictFileName, compressionLevel, comprParams);
 
     /* init */
     assert(outFileName != NULL || suffix != NULL);
@@ -1547,10 +1581,12 @@ static unsigned FIO_fwriteSparse(FIO_prefs_t* const prefs, FILE* file, const voi
     return storedSkips;
 }
 
-static void FIO_fwriteSparseEnd(FIO_prefs_t* const prefs, FILE* file, unsigned storedSkips)
+static void
+FIO_fwriteSparseEnd(FIO_prefs_t* const prefs, FILE* file, unsigned storedSkips)
 {
     if (storedSkips>0) {
         assert(prefs->sparseFileSupport > 0);  /* storedSkips>0 implies sparse support is enabled */
+        (void)prefs;   /* assert can be disabled, in which case prefs becomes unused */
         if (LONG_SEEK(file, storedSkips-1, SEEK_CUR) != 0)
             EXM_THROW(69, "Final skip error (sparse file support)");
         /* last zero must be explicitly written,

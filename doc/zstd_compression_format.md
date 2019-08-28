@@ -16,7 +16,7 @@ Distribution of this document is unlimited.
 
 ### Version
 
-0.3.1 (25/10/18)
+0.3.3 (16/08/19)
 
 
 Introduction
@@ -358,6 +358,7 @@ It may be followed by an optional `Content_Checksum`
 __`Block_Type`__
 
 The next 2 bits represent the `Block_Type`.
+`Block_Type` influences the meaning of `Block_Size`.
 There are 4 block types :
 
 |    Value     |      0      |      1      |         2          |     3     |
@@ -384,15 +385,16 @@ There are 4 block types :
 __`Block_Size`__
 
 The upper 21 bits of `Block_Header` represent the `Block_Size`.
-`Block_Size` is the size of the block excluding the header.
-A block can contain any number of bytes (even zero), up to
-`Block_Maximum_Decompressed_Size`, which is the smallest of:
+When `Block_Type` is `Compressed_Block` or `Raw_Block`,
+`Block_Size` is the size of `Block_Content`, hence excluding `Block_Header`.  
+When `Block_Type` is `RLE_Block`, `Block_Content`’s size is always 1,
+and `Block_Size` represents the number of times this byte must be repeated.
+A block can contain and decompress into any number of bytes (even zero),
+up to `Block_Maximum_Decompressed_Size`, which is the smallest of:
 -  Window_Size
 -  128 KB
 
-A `Compressed_Block` has the extra restriction that `Block_Size` is always
-strictly less than the decompressed size.
-If this condition cannot be respected,
+If this condition cannot be respected when generating a `Compressed_Block`,
 the block must be sent uncompressed instead (`Raw_Block`).
 
 
@@ -1655,6 +1657,8 @@ or at least provide a meaningful error code explaining for which reason it canno
 
 Version changes
 ---------------
+- 0.3.3 : clarifications for field Block_Size
+- 0.3.2 : remove additional block size restriction on compressed blocks
 - 0.3.1 : minor clarification regarding offset history update rules
 - 0.3.0 : minor edits to match RFC8478
 - 0.2.9 : clarifications for huffman weights direct representation, by Ulrich Kunitz

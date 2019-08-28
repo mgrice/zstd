@@ -14,6 +14,7 @@
 #ifndef FUZZ_HELPERS_H
 #define FUZZ_HELPERS_H
 
+#include "debug.h"
 #include "fuzz.h"
 #include "xxhash.h"
 #include "zstd.h"
@@ -55,7 +56,7 @@ extern "C" {
 #endif
 
 /**
- * Determininistically constructs a seed based on the fuzz input.
+ * Deterministically constructs a seed based on the fuzz input.
  * Consumes up to the first FUZZ_RNG_SEED_SIZE bytes of the input.
  */
 FUZZ_STATIC uint32_t FUZZ_seed(uint8_t const **src, size_t* size) {
